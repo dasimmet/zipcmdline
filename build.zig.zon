@@ -2,14 +2,13 @@
     .name = .zipcmdline,
     .fingerprint = 0xcca72bd3d3a2580c,
     .version = "0.0.0",
-    .zig_version = "0.15.2",
+    .zig_version = "0.16.0-dev.2905+5d71e3051",
     // the buffer-stress tests fails on version 0.15.0 on windows
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.16.0-dev.2905+5d71e3051",
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "test",
-        "backport",
     },
 }

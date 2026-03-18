@@ -9,67 +9,31 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(0xff);
 }
 
-fn usage() !void {
-    try std.fs.File.stderr().writeAll(
+fn usage(io: std.Io) !void {
+    try std.Io.File.stderr().writeStreamingAll(
+        io,
         "Usage: zip [-options] ZIP_FILE FILES/DIRS..\n",
     );
 }
 
-var windows_args_arena = if (builtin.os.tag == .windows)
-    std.heap.ArenaAllocator.init(std.heap.page_allocator)
-else
-    struct {}{};
-pub fn cmdlineArgs() [][*:0]u8 {
-    if (builtin.os.tag == .windows) {
-        const slices = std.process.argsAlloc(windows_args_arena.allocator()) catch |err| switch (err) {
-            error.OutOfMemory => oom(error.OutOfMemory),
-            //error.InvalidCmdLine => @panic("InvalidCmdLine"),
-            error.Overflow => @panic("Overflow while parsing command line"),
-        };
-        const args = windows_args_arena.allocator().alloc([*:0]u8, slices.len - 1) catch |e| oom(e);
-        for (slices[1..], 0..) |slice, i| {
-            args[i] = slice.ptr;
-        }
-        return args;
-    }
-    return std.os.argv.ptr[1..std.os.argv.len];
-}
-
-pub fn main() !void {
-    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_instance.deinit();
-    const arena = arena_instance.allocator();
-
-    const cmd_args = blk: {
-        const cmd_args = cmdlineArgs();
-        var arg_index: usize = 0;
-        var non_option_len: usize = 0;
-        while (arg_index < cmd_args.len) : (arg_index += 1) {
-            const arg = std.mem.span(cmd_args[arg_index]);
-            if (!std.mem.startsWith(u8, arg, "-")) {
-                cmd_args[non_option_len] = arg;
-                non_option_len += 1;
-            } else {
-                fatal("unknown cmdline option '{s}'", .{arg});
-            }
-        }
-        break :blk cmd_args[0..non_option_len];
-    };
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    const cmd_args = try init.minimal.args.toSlice(arena);
+    const cwd = std.Io.Dir.cwd();
 
     if (cmd_args.len < 2) {
-        try usage();
+        try usage(io);
         std.process.exit(0xff);
     }
-    const zip_file_arg = std.mem.span(cmd_args[0]);
-    const paths_to_include = cmd_args[1..];
+    const zip_file_arg = cmd_args[1];
+    const paths_to_include = cmd_args[2..];
 
     // expand cmdline arguments to a list of files
-    var file_entries: std.ArrayListUnmanaged(FileEntry) = .{};
-    for (paths_to_include) |path_ptr| {
-        const path = std.mem.span(path_ptr);
-
+    var file_entries: std.ArrayListUnmanaged(FileEntry) = .empty;
+    for (paths_to_include) |path| {
         const kind: union(enum) { file: u64, directory: void } = blk: {
-            const stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
+            const stat = cwd.statFile(io, path, .{}) catch |err| switch (err) {
                 error.FileNotFound => fatal("path '{s}' is not found", .{path}),
                 error.IsDir => break :blk .directory,
                 else => |e| return e,
@@ -91,11 +55,12 @@ pub fn main() !void {
         };
         switch (kind) {
             .directory => try scanDirectory(
+                io,
                 arena,
                 &file_entries,
                 path,
                 "",
-                std.fs.cwd(),
+                cwd,
                 path,
             ),
             .file => |file_size| {
@@ -114,21 +79,21 @@ pub fn main() !void {
     // no need to free
 
     {
-        const zip_file = std.fs.cwd().createFile(zip_file_arg, .{}) catch |err|
+        const zip_file = cwd.createFile(io, zip_file_arg, .{}) catch |err|
             fatal("create file '{s}' failed: {s}", .{ zip_file_arg, @errorName(err) });
-        defer zip_file.close();
+        defer zip_file.close(io);
         var file_buffer: [9]u8 = undefined;
-        var file_writer = zip_file.writer(&file_buffer);
-        try writeZip(&file_writer, file_entries.items, store);
+        var file_writer = zip_file.writer(io, &file_buffer);
+        try writeZip(io, &file_writer, file_entries.items, store);
         try file_writer.interface.flush();
     }
 
     // go fix up the local file headers
     {
-        const zip_file = std.fs.cwd().openFile(zip_file_arg, .{ .mode = .read_write }) catch |err|
+        const zip_file = cwd.openFile(io, zip_file_arg, .{ .mode = .read_write }) catch |err|
             fatal("open file '{s}' failed: {s}", .{ zip_file_arg, @errorName(err) });
-        defer zip_file.close();
-        var writer = zip_file.writer(&.{});
+        defer zip_file.close(io);
+        var writer = zip_file.writer(io, &.{});
         for (file_entries.items, 0..) |file, i| {
             if (file.zip_path[file.zip_path.len - 1] == '/') continue;
             try writer.seekTo(store[i].file_offset);
@@ -159,12 +124,14 @@ const FileEntry = struct {
 };
 
 fn writeZip(
-    file_writer: *std.fs.File.Writer,
+    io: std.Io,
+    file_writer: *std.Io.File.Writer,
     file_entries: []const FileEntry,
     store: []FileStore,
 ) !void {
     var first_central_offset: ?u64 = null;
     var cd_count: u64 = 0;
+    const cwd = std.Io.Dir.cwd();
 
     for (file_entries, 0..) |file_entry, i| {
         const file_offset = file_writer.pos + file_writer.interface.buffered().len;
@@ -193,13 +160,13 @@ fn writeZip(
 
         var file = blk: {
             if (file_entry.dir) |dir| {
-                var entry_dir = try std.fs.cwd().openDir(dir, .{});
-                defer entry_dir.close();
-                break :blk try entry_dir.openFile(file_entry.zip_path, .{});
+                var entry_dir = try cwd.openDir(io, dir, .{});
+                defer entry_dir.close(io);
+                break :blk try entry_dir.openFile(io, file_entry.zip_path, .{});
             }
-            break :blk try std.fs.cwd().openFile(file_entry.zip_path, .{});
+            break :blk try cwd.openFile(io, file_entry.zip_path, .{});
         };
-        defer file.close();
+        defer file.close(io);
 
         var crc32: u32 = undefined;
 
@@ -223,10 +190,10 @@ fn writeZip(
             .deflate => {
                 const start_offset = file_writer.pos + file_writer.interface.buffered().len;
                 var read_buffer: [4096]u8 = undefined;
-                var reader = Crc32Reader.init(&read_buffer, file);
+                var reader = Crc32Reader.init(io, &read_buffer, file);
 
                 var compress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-                var compressor: @import("backport").compress.flate.Compress = try .init(
+                var compressor: std.compress.flate.Compress = try .init(
                     &file_writer.interface,
                     &compress_buffer,
                     .raw,
@@ -287,17 +254,18 @@ fn joinZipPath(
 }
 
 fn scanDirectory(
+    io: std.Io,
     allocator: std.mem.Allocator,
     file_entries: *std.ArrayListUnmanaged(FileEntry),
     top_level_dir: []const u8,
     relative_path: []const u8,
-    parent_dir: std.fs.Dir,
+    parent_dir: std.Io.Dir,
     dir_path: []const u8,
 ) !void {
-    var dir = try parent_dir.openDir(dir_path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try parent_dir.openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         const entry_kind: EntryKind = switch (entry.kind) {
             .directory => .directory,
             .file => .file,
@@ -315,6 +283,7 @@ fn scanDirectory(
             .directory => {
                 const entry_count_before = file_entries.items.len;
                 try scanDirectory(
+                    io,
                     allocator,
                     file_entries,
                     top_level_dir,
@@ -333,7 +302,7 @@ fn scanDirectory(
                 }
             },
             .file => {
-                const stat = try dir.statFile(entry.name);
+                const stat = try dir.statFile(io, entry.name, .{});
                 try file_entries.ensureUnusedCapacity(allocator, 1);
                 free_zip_path = false;
                 file_entries.appendAssumeCapacity(.{
@@ -347,12 +316,14 @@ fn scanDirectory(
 }
 
 const Crc32Reader = struct {
+    io: std.Io,
     interface: std.Io.Reader,
-    file: std.fs.File,
+    file: std.Io.File,
     crc32: std.hash.Crc32 = std.hash.Crc32.init(),
 
-    pub fn init(buffer: []u8, file: std.fs.File) Crc32Reader {
+    pub fn init(io: std.Io, buffer: []u8, file: std.Io.File) Crc32Reader {
         return .{
+            .io = io,
             .interface = .{ .vtable = &vtable, .buffer = buffer, .seek = 0, .end = 0 },
             .file = file,
             .crc32 = std.hash.Crc32.init(),
@@ -369,10 +340,11 @@ const Crc32Reader = struct {
         const self: *Crc32Reader = @alignCast(@fieldParentPtr("interface", r));
         const dest = limit.slice(try w.writableSliceGreedy(1));
         if (dest.len == 0) return 0;
-        const n = self.file.read(dest) catch |err| switch (err) {
+        const n = self.file.readStreaming(self.io, &.{dest}) catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
             else => return error.ReadFailed,
         };
-        if (n == 0) return error.EndOfStream;
+        if (n == 0) return n;
         self.crc32.update(dest[0..n]);
         w.advance(n);
         return n;
