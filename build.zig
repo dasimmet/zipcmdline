@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) !void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/zip.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
 
@@ -68,8 +68,12 @@ fn addExe(
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+    if (@hasField(@TypeOf(b.*), "args")) {
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
+    } else {
+        run_cmd.addPassthruArgs();
     }
     const run_step = b.step(@tagName(kind), "Run " ++ @tagName(kind));
     run_step.dependOn(&run_cmd.step);
@@ -87,11 +91,10 @@ fn addTests(
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/runner.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
-    inline for (std.meta.fields(TestCase)) |field| {
-        const case: TestCase = @enumFromInt(field.value);
+    inline for (std.enums.values(TestCase)) |case| {
         const run = b.addRunArtifact(test_runner);
         run.setName(@tagName(case));
         run.addArg(@tagName(case));
@@ -165,6 +168,21 @@ fn ci(
     }
 }
 
+fn getInstallPathCompat(b: *std.Build, dir: std.Build.InstallDir, sub_path: []const u8) []const u8 {
+    if (@hasDecl(@TypeOf(b.*), "getInstallPath")) {
+        return b.getInstallPath(dir, sub_path);
+    }
+    const base = switch (dir) {
+        .prefix => "zig-out",
+        .bin => "zig-out/bin",
+        .lib => "zig-out/lib",
+        .header => "zig-out/include",
+        .custom => |c| b.pathJoin(&.{ "zig-out", c }),
+    };
+    if (sub_path.len == 0 or std.mem.eql(u8, sub_path, ".")) return base;
+    return b.pathJoin(&.{ base, sub_path });
+}
+
 fn makeCiArchiveStep(
     b: *std.Build,
     ci_target_str: []const u8,
@@ -173,7 +191,7 @@ fn makeCiArchiveStep(
     unzip_exe_install: *std.Build.Step.InstallArtifact,
     host_zip_exe: *std.Build.Step.Compile,
 ) *std.Build.Step {
-    const install_path = b.getInstallPath(.prefix, ".");
+    const install_path = getInstallPathCompat(b, .prefix, ".");
 
     if (target.os.tag == .windows) {
         const out_zip_file = b.pathJoin(&.{
@@ -186,7 +204,8 @@ fn makeCiArchiveStep(
         zip.addArg("zip.pdb");
         zip.addArg("unzip.exe");
         zip.addArg("unzip.pdb");
-        zip.cwd = .{ .cwd_relative = b.getInstallPath(
+        zip.cwd = .{ .cwd_relative = getInstallPathCompat(
+            b,
             zip_exe_install.dest_dir.?,
             ".",
         ) };
@@ -206,7 +225,8 @@ fn makeCiArchiveStep(
         "zip",
         "unzip",
     });
-    tar.cwd = .{ .cwd_relative = b.getInstallPath(
+    tar.cwd = .{ .cwd_relative = getInstallPathCompat(
+        b,
         zip_exe_install.dest_dir.?,
         ".",
     ) };
